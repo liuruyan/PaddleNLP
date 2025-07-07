@@ -791,7 +791,16 @@ class FakeGate(paddle.autograd.PyLayer):
 
 
 class MoEGate(PretrainedMoEGate):
-    def __init__(self, config, num_experts, expert_hidden_size, norm_weight=None, norm_eps=None, **kwargs):
+    def __init__(
+        self,
+        config,
+        num_experts,
+        expert_hidden_size,
+        using_post_norm_recompute=False,
+        norm_weight=None,
+        norm_eps=None,
+        **kwargs
+    ):
         super().__init__(config, num_experts, expert_hidden_size, **kwargs)
         # [hidden_size, n_expert]
 
@@ -806,6 +815,8 @@ class MoEGate(PretrainedMoEGate):
         )
 
         self.config = config
+        self.using_post_norm_recompute = using_post_norm_recompute
+
         if config.topk_method == "noaux_tc":
             self.e_score_correction_bias = paddle.create_parameter(
                 shape=[num_experts],
@@ -813,7 +824,8 @@ class MoEGate(PretrainedMoEGate):
                 default_initializer=nn.initializer.Constant(0.0),
             )
             self.e_score_correction_bias.is_distributed = True
-        if hasattr(self.config, "using_norm_gate_recompute") and self.config.using_norm_gate_recompute:
+
+        if self.using_post_norm_recompute:
             assert norm_weight is not None and norm_eps is not None
             self.norm_weight = norm_weight
             self.norm_eps = norm_eps
@@ -827,7 +839,7 @@ class MoEGate(PretrainedMoEGate):
         _, _, h_dim = hidden_states.shape
 
         # compute gating score
-        if hasattr(self.config, "using_norm_gate_recompute") and self.config.using_norm_gate_recompute:
+        if self.using_post_norm_recompute:
             logits, norm_out = FusedNormGateFunc.apply(hidden_states, self.norm_weight, self.weight, self.norm_eps)
         else:
             with paddle.amp.auto_cast(False):
@@ -850,7 +862,7 @@ class MoEGate(PretrainedMoEGate):
             ret = self.topkgating(scores)  # (capacity, combine_weights, dispatch_mask, exp_counts, l_aux, l_zloss)
 
         # Append norm_out if needed
-        if hasattr(self.config, "using_norm_gate_recompute") and self.config.using_norm_gate_recompute:
+        if self.using_post_norm_recompute:
             ret = (*ret, norm_out)
 
         return ret
@@ -884,6 +896,10 @@ class DeepseekV2MoE(MoELayer):
     def __init__(self, config: DeepseekV2Config, norm_weight=None, norm_eps=None):
         assert config.tensor_parallel_degree <= 1, "tensor_parallel_degree should be 1"
 
+        self.using_post_norm_recompute = config.using_post_norm_recompute
+        if self.using_post_norm_recompute:
+            assert norm_weight is not None and norm_eps is not None
+
         gate = MoEGate(
             config=config,
             num_experts=config.n_routed_experts,
@@ -895,12 +911,11 @@ class DeepseekV2MoE(MoELayer):
             norm_topk_prob=config.norm_topk_prob,
             routed_scaling_factor=config.routed_scaling_factor,
             drop_tokens=False,
+            using_post_norm_recompute=self.using_post_norm_recompute,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
         )
         DeepseekV2MLPClass = FP8Mlp if DSV3_USE_FP8_GEMM else DeepseekV2MLP
-
-        self.using_norm_gate_recompute = config.using_norm_gate_recompute
 
         super().__init__(
             config=config,
@@ -914,7 +929,7 @@ class DeepseekV2MoE(MoELayer):
             gate=gate,
             capacity=2.0,
             moe_group="expert",
-            using_norm_gate_recompute=self.using_norm_gate_recompute,
+            using_post_norm_recompute=self.using_post_norm_recompute,
         )
 
         moe_grad_group = fleet.get_hybrid_communicate_group().expert_grad_comm_group
@@ -924,22 +939,33 @@ class DeepseekV2MoE(MoELayer):
         self.alpha = config.aux_loss_alpha
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV2MLPClass(config=config, intermediate_size=intermediate_size, is_moe=False)
+            if self.using_post_norm_recompute:
+                assert isinstance(DeepseekV2MLPClass, FP8Mlp)
+                self.shared_experts = DeepseekV2MLPClass(
+                    config=config,
+                    intermediate_size=intermediate_size,
+                    is_moe=False,
+                    using_post_norm_recompute=self.using_post_norm_recompute,
+                    norm_weight=norm_weight,
+                    norm_eps=norm_eps,
+                )
+            else:
+                self.shared_experts = DeepseekV2MLPClass(
+                    config=config, intermediate_size=intermediate_size, is_moe=False
+                )
 
     def forward(self, hidden_states):
-        if self.using_norm_gate_recompute:
+        if self.using_post_norm_recompute:
             super().update_flex_token()
             if self.using_flex_token:
                 probs, routing_map, l_aux, l_zloss, norm_out = self.router(hidden_states)
-                hidden_states = norm_out
                 final_hidden_states, l_aux, l_zloss = super().forward(
-                    hidden_states, probs=probs, routing_map=routing_map, l_aux=l_aux, l_zloss=l_zloss
+                    norm_out, probs=probs, routing_map=routing_map, l_aux=l_aux, l_zloss=l_zloss
                 )
             else:
                 capacity, topk_weight, topk_ids, token_priority, l_aux, l_zloss, norm_out = self.gate(hidden_states)
-                hidden_states = norm_out
                 final_hidden_states, l_aux, l_zloss = super().forward(
-                    hidden_states,
+                    norm_out,
                     capacity=capacity,
                     topk_weight=topk_weight,
                     topk_ids=topk_ids,
@@ -1849,7 +1875,7 @@ class DeepseekV2DecoderLayer(nn.Layer):
         self.enable_recompute = False
         self.layerwise_recompute = layerwise_recompute
         self.recompute_granularity = config.recompute_granularity
-        self.using_norm_gate_recompute = config.using_norm_gate_recompute
+        self.using_post_norm_recompute = config.using_post_norm_recompute
 
         self.hidden_size = config.hidden_size
 
@@ -1869,7 +1895,7 @@ class DeepseekV2DecoderLayer(nn.Layer):
                 DeepseekV2MoE(
                     config, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon
                 )
-                if config.using_norm_gate_recompute
+                if config.using_post_norm_recompute
                 else DeepseekV2MoE(config)
             )
         else:
@@ -1953,7 +1979,7 @@ class DeepseekV2DecoderLayer(nn.Layer):
         # Fully Connected
         residual = hidden_states
 
-        if not (self.using_norm_gate_recompute and isinstance(self.mlp, DeepseekV2MoE)):
+        if not (self.using_post_norm_recompute and isinstance(self.mlp, DeepseekV2MoE)):
             hidden_states = self.post_attention_layernorm(hidden_states)
 
         hidden_states = self.mlp(hidden_states)
