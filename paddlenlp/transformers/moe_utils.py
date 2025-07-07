@@ -19,6 +19,11 @@ import paddle
 
 from .fp8_utils import dequantize_fp8_to_fp32
 
+try:
+    import TokenDispatcherUtils as TDU
+except:
+    pass
+
 if not hasattr(paddle.Tensor, "_clear_to_zero_allocation"):
 
     def _clear_to_zero_allocation(self):
@@ -145,35 +150,49 @@ class UnZipNode:
         num_experts,
         tokens_per_expert,
     ):
-        with paddle.amp.auto_cast(False):
-            (unzipped_tokens, zipped_expertwise_rowmap, unzipped_probs, _,) = paddle.nn.functional.moe_permute(
-                hs_2d_dispatched,
-                None,
+        if isinstance(hs_2d_dispatched, tuple):
+            (unzipped_tokens, zipped_expertwise_rowmap, unzipped_probs, unzipped_scale,) = TDU.tokens_unzip_stable(
+                hs_2d_dispatched[0],
+                hs_2d_dispatched[1],
                 dispatched_indices,
                 dispatched_probs,
+                topk=topk,
                 num_experts=num_experts,
                 tokens_per_expert=tokens_per_expert,
-                padding_alignment=128,
+                padding_multiplex=128,
             )
+        else:
+            with paddle.amp.auto_cast(False):
+                (
+                    unzipped_tokens,
+                    zipped_expertwise_rowmap,
+                    unzipped_probs,
+                    unzipped_scale,
+                ) = paddle.nn.functional.moe_permute(
+                    hs_2d_dispatched,
+                    None,
+                    dispatched_indices,
+                    dispatched_probs,
+                    num_experts=num_experts,
+                    tokens_per_expert=tokens_per_expert,
+                    padding_alignment=128,
+                )
         self.unzipped_probs = unzipped_probs
         self.zipped_expertwise_rowmap = zipped_expertwise_rowmap
-        return (
-            unzipped_tokens,
-            zipped_expertwise_rowmap,
-            unzipped_probs,
-        )
+        return (unzipped_tokens, zipped_expertwise_rowmap, unzipped_probs, unzipped_scale)
 
     @paddle.no_grad()
     def backward(self, dx, hidden_states_out_grad, probs_grad, dispatched_indices, num_experts):
-        with paddle.amp.auto_cast(False):
-            weighted_zipped_tokens, probs_grad_zipped = paddle.nn.functional.moe_unpermute(
-                dx,
-                self.zipped_expertwise_rowmap,
-                dispatched_indices,
-                probs_grad,
-                total_zipped_tokens=hidden_states_out_grad.shape[0],
-                num_experts=num_experts,
-            )
+        weighted_zipped_tokens, probs_grad_zipped = TDU.tokens_zip(
+            dx,
+            self.zipped_expertwise_rowmap,
+            dispatched_indices,
+            probs_grad,
+            total_zipped_tokens=hidden_states_out_grad[0].shape[0]
+            if isinstance(hidden_states_out_grad, tuple)
+            else hidden_states_out_grad.shape[0],
+            num_experts=num_experts,
+        )
         self.reset_statue()
         return weighted_zipped_tokens, probs_grad_zipped
 
@@ -187,10 +206,9 @@ class ZipNode:
     def forward(
         self, expert_out, zipped_expertwise_rowmap, routemap_topk, unzipped_probs, total_zipped_tokens, num_experts
     ):
-        with paddle.amp.auto_cast(False):
-            expert_out_zipped, zipped_probs_topk = paddle.nn.functional.moe_unpermute(
-                expert_out, zipped_expertwise_rowmap, routemap_topk, unzipped_probs, total_zipped_tokens, num_experts
-            )
+        expert_out_zipped, zipped_probs_topk = TDU.tokens_zip(
+            expert_out, zipped_expertwise_rowmap, routemap_topk, unzipped_probs, total_zipped_tokens, num_experts
+        )
         return expert_out_zipped
 
     @paddle.no_grad()
@@ -203,16 +221,39 @@ class ZipNode:
         num_experts,
         tokens_per_expert,
     ):
-        with paddle.amp.auto_cast(False):
-            (unzipped_grad, zipped_expertwise_rowmap_grad, unzipped_probs_grad, _,) = paddle.nn.functional.moe_permute(
-                grad_output,
-                None,
+        if isinstance(grad_output, tuple):
+            (
+                unzipped_grad,
+                zipped_expertwise_rowmap_grad,
+                unzipped_probs_grad,
+                unzipped_scale_grad,
+            ) = TDU.tokens_unzip_stable(
+                grad_output[0],
+                grad_output[1],
                 dispatched_indices,
                 dispatched_probs,
+                top_k,
                 num_experts,
                 tokens_per_expert,
-                padding_alignment=128,
+                padding_multiplex=128,
             )
+            return (unzipped_grad, unzipped_scale_grad)
+        else:
+            with paddle.amp.auto_cast(False):
+                (
+                    unzipped_grad,
+                    zipped_expertwise_rowmap_grad,
+                    unzipped_probs_grad,
+                    unzipped_scale_grad,
+                ) = paddle.nn.functional.moe_permute(
+                    grad_output,
+                    None,
+                    dispatched_indices,
+                    dispatched_probs,
+                    num_experts,
+                    tokens_per_expert,
+                    padding_alignment=128,
+                )
 
         return unzipped_grad
 
